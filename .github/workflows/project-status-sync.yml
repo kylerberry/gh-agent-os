@@ -1,0 +1,54 @@
+name: Project Status Sync
+
+on:
+  issues:
+    types: [opened, labeled, closed]
+  pull_request:
+    types: [opened, closed]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: project-status-sync-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: vars.AGENT_PROJECT_SYNC_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: transition
+        uses: actions/github-script@v7
+        env:
+          TRIAGE: ${{ vars.AGENT_PROJECT_STATUS_TRIAGE }}
+          IN_PROGRESS: ${{ vars.AGENT_PROJECT_STATUS_IN_PROGRESS }}
+          BLOCKED: ${{ vars.AGENT_PROJECT_STATUS_BLOCKED }}
+          IN_REVIEW: ${{ vars.AGENT_PROJECT_STATUS_IN_REVIEW }}
+          DONE: ${{ vars.AGENT_PROJECT_STATUS_DONE }}
+          CANCELLED: ${{ vars.AGENT_PROJECT_STATUS_CANCELLED }}
+        with:
+          script: |
+            const set = (number, option) => { core.setOutput('issue_number', number); core.setOutput('status_option_id', option); };
+            if (context.eventName === 'issues') {
+              const issue = context.payload.issue; const action = context.payload.action; const label = context.payload.label?.name;
+              if (action === 'opened') set(issue.number, process.env.TRIAGE);
+              if (action === 'labeled' && label === 'agent:implement') set(issue.number, process.env.IN_PROGRESS);
+              if (action === 'labeled' && label === 'agent:needs-human') set(issue.number, process.env.BLOCKED);
+              if (action === 'closed') set(issue.number, issue.state_reason === 'not_planned' ? process.env.CANCELLED : process.env.DONE);
+            }
+            if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request; const match = pr.head.ref.match(/^agent\/issue-(\d+)(?:-|$)/);
+              if (match && context.payload.action === 'opened') set(match[1], process.env.IN_REVIEW);
+              if (match && context.payload.action === 'closed' && pr.merged) set(match[1], process.env.DONE);
+            }
+      - if: steps.transition.outputs.issue_number != '' && steps.transition.outputs.status_option_id != ''
+        env:
+          GH_PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          AGENT_PROJECT_ID: ${{ vars.AGENT_PROJECT_ID }}
+          AGENT_PROJECT_STATUS_FIELD_ID: ${{ vars.AGENT_PROJECT_STATUS_FIELD_ID }}
+        run: bash scripts/agents/project-status.sh "${{ steps.transition.outputs.issue_number }}" "${{ steps.transition.outputs.status_option_id }}"

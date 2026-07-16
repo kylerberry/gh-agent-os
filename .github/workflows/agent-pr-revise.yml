@@ -1,0 +1,326 @@
+name: Agent PR Revise
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: agent-pr-revise-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Authorize PR revision trigger
+    if: vars.AGENT_IMPLEMENT_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.authorize.outputs.allowed }}
+      reason: ${{ steps.authorize.outputs.reason }}
+      pr_number: ${{ steps.authorize.outputs.pr_number }}
+      comment_id: ${{ steps.authorize.outputs.comment_id }}
+      trigger_kind: ${{ steps.authorize.outputs.trigger_kind }}
+      head_ref: ${{ steps.authorize.outputs.head_ref }}
+      head_sha: ${{ steps.authorize.outputs.head_sha }}
+    steps:
+      - name: Authorize trigger
+        id: authorize
+        uses: actions/github-script@v7
+        env:
+          TRUSTED_BOT_ACTORS: ${{ vars.AGENT_PR_REVISE_TRUSTED_BOT_ACTORS }}
+        with:
+          script: |
+            const deny = (reason) => {
+              core.info(`Skipping PR revision: ${reason}`);
+              core.setOutput('allowed', 'false');
+              core.setOutput('reason', reason);
+            };
+
+            const actor = context.actor;
+            const eventName = context.eventName;
+
+            let prNumber;
+            let trigger;
+            let triggerKind;
+
+            if (eventName === 'issue_comment') {
+              const issue = context.payload.issue;
+              if (!issue?.pull_request) {
+                deny('comment is not on a pull request');
+                return;
+              }
+              prNumber = issue.number;
+              trigger = context.payload.comment;
+              triggerKind = 'issue_comment';
+            } else if (eventName === 'pull_request_review') {
+              prNumber = context.payload.pull_request?.number;
+              trigger = context.payload.review;
+              triggerKind = 'pull_request_review';
+            } else {
+              deny(`unsupported event ${eventName}`);
+              return;
+            }
+
+            if (!prNumber) {
+              deny('could not determine pull request number');
+              return;
+            }
+
+            const body = trigger?.body || '';
+            const hasCommand = body.trimStart().split(/\r?\n/, 1)[0] === '/agent fix-this';
+            if (!hasCommand) {
+              deny(`${triggerKind} does not contain /agent fix-this command`);
+              return;
+            }
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.state !== 'open') {
+              deny(`PR is ${pr.state}`);
+              return;
+            }
+
+            if (pr.head.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+              deny('PR head is not in this repository');
+              return;
+            }
+
+            if (!pr.head.ref.startsWith('agent/issue-')) {
+              deny(`PR head branch ${pr.head.ref} is not an agent/issue-* branch`);
+              return;
+            }
+
+            const trustedBotActors = (process.env.TRUSTED_BOT_ACTORS || 'github-copilot[bot],copilot-pull-request-reviewer[bot]')
+              .split(',')
+              .map((value) => value.trim())
+              .filter(Boolean);
+            let allowed = trustedBotActors.includes(actor);
+
+            if (!allowed) {
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  username: actor,
+                });
+                allowed = ['admin', 'maintain', 'write'].includes(data.permission);
+                if (!allowed) {
+                  deny(`actor ${actor} has ${data.permission} permission; write/maintain/admin required`);
+                  return;
+                }
+              } catch (error) {
+                deny(`could not verify actor permission for ${actor}: ${error.message}`);
+                return;
+              }
+            }
+
+            core.setOutput('allowed', 'true');
+            core.setOutput('reason', 'authorized');
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('comment_id', String(trigger.id));
+            core.setOutput('trigger_kind', triggerKind);
+            core.setOutput('head_ref', pr.head.ref);
+            core.setOutput('head_sha', pr.head.sha);
+
+  revise:
+    name: Revise PR
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.authorize.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Build PR revision prompt
+        id: prompt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          COMMENT_ID: ${{ needs.authorize.outputs.comment_id }}
+          TRIGGER_KIND: ${{ needs.authorize.outputs.trigger_kind }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGERING_ACTOR: ${{ github.actor }}
+        run: |
+          {
+            echo 'text<<AGENT_PR_REVISE_PROMPT_EOF'
+            node scripts/agents/build-pr-revision-prompt.cjs
+            echo ''
+            echo 'AGENT_PR_REVISE_PROMPT_EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Run Claude PR revision agent
+        id: revise
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: |
+            --model ${{ vars.AGENT_PR_REVISE_MODEL }}
+            --max-turns 60
+            --allowedTools "Read,Grep,Glob,Edit,Write,MultiEdit,Bash(git status:*),Bash(git diff:*),Bash(ruby:*),Bash(npm test:*),Bash(npm run:*),Bash(pnpm test:*),Bash(pnpm run:*),Bash(yarn test:*),Bash(yarn run:*),Bash(deno test:*),Bash(cargo test:*),Bash(go test:*)"
+            --json-schema '{"type":"object","properties":{"status":{"type":"string","enum":["complete","blocked"]},"summary_markdown":{"type":"string"},"blocked_markdown":{"type":"string"}},"required":["status"],"additionalProperties":false}'
+
+      - name: Parse revision outcome
+        id: outcome
+        uses: actions/github-script@v7
+        env:
+          STRUCTURED_OUTPUT: ${{ steps.revise.outputs.structured_output }}
+        with:
+          script: |
+            const fs = require('fs');
+            const fallback = [
+              '## Agent Revision Complete',
+              '',
+              'Claude did not return structured output. Continuing with branch change verification.',
+            ].join('\n');
+
+            if (!process.env.STRUCTURED_OUTPUT) {
+              core.setFailed('Claude did not return structured output; refusing to commit or push a revision.');
+              return;
+            }
+
+            let parsed;
+            try {
+              parsed = JSON.parse(process.env.STRUCTURED_OUTPUT);
+            } catch (error) {
+              core.setFailed(`Claude structured output was not valid JSON: ${error.message}`);
+              return;
+            }
+
+            if (parsed.status === 'blocked') {
+              const blockedMarkdown = parsed.blocked_markdown;
+              if (!blockedMarkdown || typeof blockedMarkdown !== 'string') {
+                core.setFailed('Blocked structured output did not include blocked_markdown.');
+                return;
+              }
+              const requiredHeadings = [
+                '## Agent Revision Blocked',
+                '### Blocking Question / Action Needed',
+                '### Why I stopped',
+                '### Options',
+                '### Recommended path',
+              ];
+              for (const heading of requiredHeadings) {
+                if (!blockedMarkdown.includes(heading)) {
+                  core.setFailed(`Blocked comment missing required heading: ${heading}`);
+                  return;
+                }
+              }
+              core.setOutput('status', 'blocked');
+              fs.writeFileSync('agent-revision-message.md', blockedMarkdown);
+              return;
+            }
+
+            core.setOutput('status', 'complete');
+            fs.writeFileSync(
+              'agent-revision-message.md',
+              parsed.summary_markdown || '## Agent Revision Complete\n\nRevision completed. See pushed commits and workflow logs for details.'
+            );
+
+      - name: Commit and push revision changes
+        id: push
+        if: steps.outcome.outputs.status != 'blocked'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
+          START_SHA: ${{ needs.authorize.outputs.head_sha }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          current_branch="$(git branch --show-current)"
+          if [ "${current_branch}" != "${HEAD_REF}" ]; then
+            echo "Expected to be on ${HEAD_REF}, but current branch is ${current_branch}." >&2
+            exit 1
+          fi
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "Address PR review feedback for #${PR_NUMBER}"
+          fi
+
+          local_head="$(git rev-parse HEAD)"
+          if [ "${local_head}" = "${START_SHA}" ]; then
+            echo "No revision changes detected."
+            echo "has_changes=false" >> "${GITHUB_OUTPUT}"
+            echo "head_sha=${local_head}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Ensure git fetch/push are authenticated in this run step.
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${REPOSITORY}.git"
+
+          git fetch --no-tags origin "${HEAD_REF}:refs/remotes/origin/${HEAD_REF}"
+          remote_head="$(git rev-parse "origin/${HEAD_REF}")"
+          if [ "${remote_head}" != "${START_SHA}" ] && [ "${remote_head}" != "${local_head}" ]; then
+            echo "Remote branch moved from ${START_SHA} to ${remote_head}; refusing to push revision over newer work." >&2
+            exit 1
+          fi
+
+          git push origin "HEAD:${HEAD_REF}"
+          echo "has_changes=true" >> "${GITHUB_OUTPUT}"
+          echo "head_sha=${local_head}" >> "${GITHUB_OUTPUT}"
+
+      - name: Post revision summary comment
+        if: always() && needs.authorize.outputs.allowed == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.authorize.outputs.pr_number }}
+          COMMENT_ID: ${{ needs.authorize.outputs.comment_id }}
+          HEAD_REF: ${{ needs.authorize.outputs.head_ref }}
+          OUTCOME_STATUS: ${{ steps.outcome.outputs.status }}
+          HAS_CHANGES: ${{ steps.push.outputs.has_changes }}
+          HEAD_SHA: ${{ steps.push.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `<!-- agent:pr-revise comment-id:${process.env.COMMENT_ID} -->`;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const message = fs.existsSync('agent-revision-message.md')
+              ? fs.readFileSync('agent-revision-message.md', 'utf8')
+              : '## Agent Revision Failed\n\nThe revision workflow did not produce a summary. Check the workflow run.';
+            const status = process.env.OUTCOME_STATUS || 'unknown';
+            const hasChanges = process.env.HAS_CHANGES || 'unknown';
+            const headSha = process.env.HEAD_SHA || 'unknown';
+            const body = [
+              marker,
+              message,
+              '',
+              '---',
+              '',
+              `Revision status: ${status}`,
+              `Branch: \`${process.env.HEAD_REF}\``,
+              `Changes pushed: ${hasChanges}`,
+              `Head SHA: \`${headSha}\``,
+              `Triggered by comment: #${process.env.COMMENT_ID}`,
+              `Workflow run: ${process.env.RUN_URL}`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });

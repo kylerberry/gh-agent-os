@@ -1,0 +1,396 @@
+name: Agent Implement
+
+on:
+  issues:
+    types: [labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: agent-implement-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Authorize trigger
+    if: >-
+      vars.AGENT_IMPLEMENT_ENABLED == 'true' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'agent:implement'
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ steps.issue.outputs.number }}
+      allowed: ${{ steps.permission.outputs.allowed }}
+    steps:
+      - name: Resolve issue number
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.payload.issue?.number;
+            if (!issueNumber) {
+              core.setFailed('No issue number provided.');
+              return;
+            }
+            core.setOutput('number', String(issueNumber));
+
+      - name: Check triggering actor permission
+        id: permission
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const actor = context.actor;
+            const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              username: actor,
+            });
+            const allowed = ['admin', 'maintain', 'write'].includes(data.permission);
+            core.setOutput('allowed', String(allowed));
+            if (!allowed) {
+              core.setFailed(`Actor ${actor} has ${data.permission} permission; write/maintain/admin required to trigger agent implementation.`);
+            }
+
+  implement:
+    name: Implement issue
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build implementation prompt
+        id: prompt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGERING_ACTOR: ${{ github.actor }}
+        run: |
+          {
+            echo 'text<<AGENT_IMPLEMENT_PROMPT_EOF'
+            node scripts/agents/build-implementation-prompt.cjs
+            echo ''
+            echo 'AGENT_IMPLEMENT_PROMPT_EOF'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Run Claude implementation agent
+        id: implement
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          branch_prefix: agent/
+          branch_name_template: "{{prefix}}issue-{{entityNumber}}-{{description}}"
+          track_progress: true
+          claude_args: |
+            --model ${{ vars.AGENT_IMPLEMENT_MODEL }}
+            --max-turns 100
+            --allowedTools "Read,Grep,Glob,Edit,Write,MultiEdit,Bash(git status:*),Bash(git diff:*),Bash(ruby:*),Bash(npm test:*),Bash(npm run:*),Bash(pnpm test:*),Bash(pnpm run:*),Bash(yarn test:*),Bash(yarn run:*),Bash(deno test:*),Bash(cargo test:*),Bash(go test:*)"
+            --json-schema '{"type":"object","properties":{"status":{"type":"string","enum":["complete","blocked"]},"blocked_markdown":{"type":"string"}},"required":["status"],"additionalProperties":false}'
+
+      - name: Handle blocked state
+        id: blocked
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          STRUCTURED_OUTPUT: ${{ steps.implement.outputs.structured_output }}
+        with:
+          script: |
+            const marker = '<!-- agent:blocked -->';
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            let parsed;
+
+            if (!process.env.STRUCTURED_OUTPUT) {
+              core.setFailed('Claude did not return structured output; refusing branch publication.');
+              return;
+            }
+
+            try {
+              parsed = JSON.parse(process.env.STRUCTURED_OUTPUT);
+            } catch (error) {
+              core.setFailed(`Claude structured output was not valid JSON: ${error.message}`);
+              return;
+            }
+
+            if (parsed.status !== 'blocked') {
+              core.setOutput('is_blocked', 'false');
+              return;
+            }
+
+            const blockedMarkdown = parsed.blocked_markdown;
+            if (!blockedMarkdown || typeof blockedMarkdown !== 'string') {
+              core.setFailed('Blocked structured output did not include blocked_markdown.');
+              return;
+            }
+
+            const requiredHeadings = [
+              '## Agent Blocked',
+              '### Blocking Question / Action Needed',
+              '### Why I stopped',
+              '### Options',
+              '### Recommended path',
+            ];
+
+            for (const heading of requiredHeadings) {
+              if (!blockedMarkdown.includes(heading)) {
+                core.setFailed(`Blocked comment missing required heading: ${heading}`);
+                return;
+              }
+            }
+
+            if (!blockedMarkdown.trimStart().startsWith('## Agent Blocked')) {
+              core.setFailed('Blocked comment must start with ## Agent Blocked.');
+              return;
+            }
+
+            const body = `${marker}\n${blockedMarkdown}`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) =>
+              comment.body?.includes(marker) && comment.user?.type === 'Bot'
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing Agent Blocked comment ${existing.id}.`);
+            } else {
+              const { data: created } = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body,
+              });
+              core.info(`Created Agent Blocked comment ${created.id}.`);
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['agent:needs-human'],
+            });
+
+            core.setOutput('is_blocked', 'true');
+
+      - name: Verify implementation branch
+        if: steps.blocked.outputs.is_blocked != 'true'
+        env:
+          BRANCH_NAME: ${{ steps.implement.outputs.branch_name }}
+        run: |
+          if [ -z "${BRANCH_NAME}" ]; then
+            echo "Claude Code did not report an implementation branch." >&2
+            exit 1
+          fi
+          case "${BRANCH_NAME}" in
+            agent/issue-*)
+              echo "Implementation branch: ${BRANCH_NAME}"
+              ;;
+            *)
+              echo "Unexpected implementation branch name: ${BRANCH_NAME}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Verify implementation branch changes
+        id: changes
+        if: steps.blocked.outputs.is_blocked != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH_NAME: ${{ steps.implement.outputs.branch_name }}
+          BASE_BRANCH: ${{ vars.AGENT_BASE_BRANCH || 'main' }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if ! git rev-parse --verify "${BRANCH_NAME}" >/dev/null 2>&1; then
+            echo "Implementation branch ${BRANCH_NAME} does not exist locally; no PR will be opened."
+            echo "has_changes=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          local_sha="$(git rev-parse "${BRANCH_NAME}")"
+
+          # Claude Code Action publishes branches in its post-job cleanup. Post-job
+          # cleanup runs after all normal workflow steps, so publish the branch here
+          # before checking for changes and opening the PR.
+          echo "Publishing implementation branch ${BRANCH_NAME} (${local_sha}) via gh api ..."
+          if gh api "repos/${REPOSITORY}/git/refs/heads/${BRANCH_NAME}" >/dev/null 2>&1; then
+            gh api "repos/${REPOSITORY}/git/refs/heads/${BRANCH_NAME}" \
+              --method PATCH \
+              --field sha="${local_sha}" \
+              --field force=false >/dev/null
+          else
+            gh api "repos/${REPOSITORY}/git/refs" \
+              --method POST \
+              --field ref="refs/heads/${BRANCH_NAME}" \
+              --field sha="${local_sha}" >/dev/null
+          fi
+
+          branch_found=false
+          for attempt in 1 2 3 4 5 6; do
+            if gh api "repos/${REPOSITORY}/git/refs/heads/${BRANCH_NAME}" >/dev/null 2>&1; then
+              branch_found=true
+              break
+            fi
+            echo "Implementation branch ${BRANCH_NAME} not visible yet; retrying (${attempt}/6)."
+            sleep 10
+          done
+
+          if [ "${branch_found}" != "true" ]; then
+            echo "Implementation branch ${BRANCH_NAME} was not published or was not visible after retry; no PR will be opened."
+            echo "has_changes=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          ahead_count="$(gh api "repos/${REPOSITORY}/compare/${BASE_BRANCH}...${BRANCH_NAME}" --jq '.ahead_by')"
+
+          if [ "${ahead_count}" = "0" ]; then
+            echo "Implementation branch ${BRANCH_NAME} has no commits ahead of ${BASE_BRANCH}; no PR will be opened."
+            echo "has_changes=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Implementation branch ${BRANCH_NAME} has ${ahead_count} commit(s) ahead of ${BASE_BRANCH}."
+          echo "has_changes=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Open or update implementation PR
+        id: pr
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          BRANCH_NAME: ${{ steps.implement.outputs.branch_name }}
+          TRIGGERING_ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_BRANCH: ${{ vars.AGENT_BASE_BRANCH || 'main' }}
+        run: |
+          set -euo pipefail
+
+          issue_title="$(gh issue view "${ISSUE_NUMBER}" --repo "${REPOSITORY}" --json title --jq '.title')"
+          issue_url="$(gh issue view "${ISSUE_NUMBER}" --repo "${REPOSITORY}" --json url --jq '.url')"
+          pr_title="Implement #${ISSUE_NUMBER}: ${issue_title}"
+          pr_body_file="$(mktemp)"
+
+          {
+            printf '%s\n' '## Summary'
+            printf '\n'
+            printf 'Implements [#%s](%s) — %s.\n' "${ISSUE_NUMBER}" "${issue_url}" "${issue_title}"
+            printf '\n'
+            printf '%s\n' '| | |'
+            printf '%s\n' '|---|---|'
+            printf '%s\n' "| **Implementation branch** | \`${BRANCH_NAME}\` |"
+            printf '%s\n' "| **Implementation trigger owner** | @${TRIGGERING_ACTOR} |"
+            printf '%s\n' "| **Validation run** | [GitHub Actions run #${GITHUB_RUN_ID}](${RUN_URL}) |"
+            printf '\n'
+            printf '%s\n' '## Changed behavior'
+            printf '\n'
+            printf 'See the [implementation agent run](%s) and the agent progress comment on [#%s](%s) for detailed changes and validation results.\n' "${RUN_URL}" "${ISSUE_NUMBER}" "${issue_url}"
+            printf '\n'
+            printf '%s\n' '## Docs checkpoint'
+            printf '\n'
+            printf 'See the implementation agent progress comment on [#%s](%s) for the docs checkpoint result.\n' "${ISSUE_NUMBER}" "${issue_url}"
+            printf '\n'
+            printf '%s\n' '## Known limitations'
+            printf '\n'
+            printf 'See the [agent run](%s) and agent progress comment for any reported limitations or blockers.\n' "${RUN_URL}"
+            printf '\n'
+            printf '%s\n' '---'
+            printf '\n'
+            printf 'Closes #%s\n' "${ISSUE_NUMBER}"
+            printf '\n'
+            printf '%s\n' '---'
+            printf '_Opened by the implementation agent. Merge requires Copilot review and approval from @%s. The agent cannot merge its own PR._\n' "${TRIGGERING_ACTOR}"
+          } > "${pr_body_file}"
+
+          existing_pr="$(gh pr list --repo "${REPOSITORY}" --head "${BRANCH_NAME}" --state open --json number,url --jq '.[0].number // ""')"
+
+          if [ -n "${existing_pr}" ]; then
+            gh pr edit "${existing_pr}" --repo "${REPOSITORY}" --title "${pr_title}" --body-file "${pr_body_file}"
+            pr_number="${existing_pr}"
+          else
+            pr_url="$(gh pr create --repo "${REPOSITORY}" --head "${BRANCH_NAME}" --base ${BASE_BRANCH} --title "${pr_title}" --body-file "${pr_body_file}")"
+            pr_number="$(gh pr view "${pr_url}" --repo "${REPOSITORY}" --json number --jq '.number')"
+          fi
+
+          pr_url="$(gh pr view "${pr_number}" --repo "${REPOSITORY}" --json url --jq '.url')"
+          echo "pr_number=${pr_number}" >> "${GITHUB_OUTPUT}"
+          echo "pr_url=${pr_url}" >> "${GITHUB_OUTPUT}"
+          echo "Implementation PR: ${pr_url}"
+
+      - name: Request PR review from trigger owner
+        if: steps.pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          TRIGGERING_ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PR_NUMBER}" ]; then
+            echo "No PR number available; skipping reviewer auto-request."
+            exit 0
+          fi
+
+          case "${TRIGGERING_ACTOR}" in
+            *"[bot]"*)
+              echo "Trigger owner ${TRIGGERING_ACTOR} is a bot; skipping reviewer auto-request."
+              exit 0
+              ;;
+          esac
+
+          permission="$(gh api "repos/${REPOSITORY}/collaborators/${TRIGGERING_ACTOR}/permission" --jq '.permission' 2>/dev/null || true)"
+          case "${permission}" in
+            admin|maintain|write|read)
+              if gh pr edit "${PR_NUMBER}" --repo "${REPOSITORY}" --add-reviewer "${TRIGGERING_ACTOR}"; then
+                echo "Requested review from @${TRIGGERING_ACTOR} on PR #${PR_NUMBER}."
+              else
+                echo "Could not request review from @${TRIGGERING_ACTOR}; skipping reviewer auto-request."
+              fi
+              ;;
+            *)
+              echo "Trigger owner ${TRIGGERING_ACTOR} is not a repo collaborator (permission: ${permission:-unknown}); skipping reviewer auto-request."
+              ;;
+          esac
+
+      - name: Remove agent:implement label
+        if: always() && (steps.blocked.outputs.is_blocked == 'true' || steps.pr.outputs.pr_number != '' || steps.changes.outputs.has_changes == 'false')
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          gh issue edit "${ISSUE_NUMBER}" --repo "${REPOSITORY}" --remove-label "agent:implement"
+
+      - name: Sync project status — Blocked on implementation failure
+        if: failure() && vars.AGENT_PROJECT_SYNC_ENABLED == 'true'
+        continue-on-error: true
+        env:
+          GH_PROJECT_TOKEN: ${{ secrets.GH_PROJECT_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ needs.authorize.outputs.issue_number }}
+          AGENT_PROJECT_ID: ${{ vars.AGENT_PROJECT_ID }}
+          AGENT_PROJECT_STATUS_FIELD_ID: ${{ vars.AGENT_PROJECT_STATUS_FIELD_ID }}
+          STATUS_OPTION_ID: ${{ vars.AGENT_PROJECT_STATUS_BLOCKED }}
+        run: |
+          bash scripts/agents/project-status.sh "${ISSUE_NUMBER}" "${STATUS_OPTION_ID}"

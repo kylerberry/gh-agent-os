@@ -1,0 +1,88 @@
+name: Agent-ready task
+
+description: Create a focused task that can be researched or implemented by an agent.
+title: "[Agent Task] "
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for work intended for the agent queue. Keep one issue small enough for one branch and one PR. For large goals, create an epic issue and child issues for each executable slice.
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Agent mode
+      description: Pick the smallest workflow that fits.
+      options:
+        - Direct implementation — clear, bounded, ready for agent:implement
+        - Research then implement — unclear or decision-heavy; start with agent:research
+        - Epic fan-out — large goal; decompose into child implementation issues
+    validations:
+      required: true
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What outcome should exist when this is done?
+      placeholder: "Example: Implementation runs should open a PR only when the agent branch has commits ahead of main."
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: What is in scope? Include likely files/areas if known.
+      placeholder: |
+        In scope:
+        - ...
+
+        Out of scope:
+        - ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance_criteria
+    attributes:
+      label: Acceptance criteria
+      description: Make these externally verifiable. The implementation agent will use them as the contract.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: validation
+    attributes:
+      label: Validation
+      description: Specific commands, workflow runs, or manual checks expected.
+      placeholder: |
+        - Run `...`
+        - Verify GitHub Actions run `...`
+    validations:
+      required: false
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks / human-only inputs
+      description: Note secrets, org/repo settings, billing/admin access, security/data/infra risks, or decisions requiring human approval.
+      placeholder: "None known."
+    validations:
+      required: false
+
+  - type: textarea
+    id: links
+    attributes:
+      label: Related issues / docs
+      description: Link explicit blockers, parent epic, prior research, or relevant docs. Do not rely on backlog-wide discovery.
+      placeholder: |
+        Parent epic: #...
+        Blocks/blocked by: #...
+        Docs: ...
+    validations:
+      required: false

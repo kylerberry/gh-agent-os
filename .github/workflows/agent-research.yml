@@ -1,0 +1,233 @@
+name: Agent Research
+
+on:
+  issues:
+    types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to research
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+concurrency:
+  group: agent-research-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  research:
+    name: Research issue
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        vars.AGENT_RESEARCH_ENABLED == 'true' &&
+        github.event.action == 'labeled' &&
+        github.event.label.name == 'agent:research'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve issue number
+        id: issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.payload.issue?.number ?? Number('${{ inputs.issue_number }}');
+            if (!issueNumber) {
+              core.setFailed('No issue number provided.');
+              return;
+            }
+            core.setOutput('number', String(issueNumber));
+
+      - name: Build research prompt
+        id: prompt
+        shell: bash
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          TRIGGERING_ACTOR: ${{ github.actor }}
+        run: |
+          {
+            echo 'text<<AGENT_RESEARCH_PROMPT_EOF'
+            cat scripts/agents/prompts/research.md
+            echo ''
+            echo '## Workflow context'
+            echo ''
+            echo "Repository: ${REPOSITORY}"
+            echo "Issue number: ${ISSUE_NUMBER}"
+            echo "GitHub event: ${EVENT_NAME}"
+            echo "Triggering actor: ${TRIGGERING_ACTOR}"
+            echo ''
+            echo 'Research this issue. Use available GitHub context/tools to inspect the issue title, body, labels, and comments. If you inspect related issues, limit that work to explicitly linked issues or directly supplied prioritized context.'
+            echo 'Return only the structured output requested by the prompt schema.'
+            echo 'AGENT_RESEARCH_PROMPT_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Run Claude research agent
+        id: research
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: |
+            --model ${{ vars.AGENT_RESEARCH_MODEL }}
+            --permission-mode plan
+            --max-turns 20
+            --allowedTools "Read,Grep,Glob,WebFetch,WebSearch,Bash(gh issue view:*)"
+            --json-schema '{"type":"object","properties":{"comment_markdown":{"type":"string"},"blocked":{"type":"boolean"},"blocked_markdown":{"type":"string"}},"anyOf":[{"required":["comment_markdown"]},{"required":["blocked","blocked_markdown"]}],"additionalProperties":false}'
+
+      - name: Handle blocked state
+        id: blocked
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          STRUCTURED_OUTPUT: ${{ steps.research.outputs.structured_output }}
+        with:
+          script: |
+            const marker = '<!-- agent:blocked -->';
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            let parsed;
+
+            try {
+              parsed = JSON.parse(process.env.STRUCTURED_OUTPUT || '{}');
+            } catch (error) {
+              core.setFailed(`Claude structured output was not valid JSON: ${error.message}`);
+              return;
+            }
+
+            if (parsed.blocked !== true) {
+              core.setOutput('is_blocked', 'false');
+              return;
+            }
+
+            const blockedMarkdown = parsed.blocked_markdown;
+            if (!blockedMarkdown || typeof blockedMarkdown !== 'string') {
+              core.setFailed('Blocked structured output did not include blocked_markdown.');
+              return;
+            }
+
+            const requiredHeadings = [
+              '## Agent Blocked',
+              '### Blocking Question / Action Needed',
+              '### Why I stopped',
+              '### Options',
+              '### Recommended path',
+            ];
+
+            for (const heading of requiredHeadings) {
+              if (!blockedMarkdown.includes(heading)) {
+                core.setFailed(`Blocked comment missing required heading: ${heading}`);
+                return;
+              }
+            }
+
+            if (!blockedMarkdown.trimStart().startsWith('## Agent Blocked')) {
+              core.setFailed('Blocked comment must start with ## Agent Blocked.');
+              return;
+            }
+
+            const body = `${marker}\n${blockedMarkdown}`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) =>
+              comment.body?.includes(marker) && comment.user?.type === 'Bot'
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing Agent Blocked comment ${existing.id}.`);
+            } else {
+              const { data: created } = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body,
+              });
+              core.info(`Created Agent Blocked comment ${created.id}.`);
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              labels: ['agent:needs-human'],
+            });
+
+            core.setOutput('is_blocked', 'true');
+
+      - name: Post or update research spec comment
+        if: steps.blocked.outputs.is_blocked != 'true'
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          STRUCTURED_OUTPUT: ${{ steps.research.outputs.structured_output }}
+        with:
+          script: |
+            const marker = '<!-- agent:research-spec -->';
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            let parsed;
+
+            try {
+              parsed = JSON.parse(process.env.STRUCTURED_OUTPUT || '{}');
+            } catch (error) {
+              core.setFailed(`Claude structured output was not valid JSON: ${error.message}`);
+              return;
+            }
+
+            const body = parsed.comment_markdown;
+            if (!body || typeof body !== 'string') {
+              core.setFailed('Claude structured output did not include comment_markdown.');
+              return;
+            }
+
+            if (!body.trimStart().startsWith(`${marker}\n## Agent Research Spec`)) {
+              core.setFailed('Research comment must start with the agent research marker and heading.');
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) =>
+              comment.body?.includes(marker) && comment.user?.type === 'Bot'
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              core.info(`Updated existing Agent Research Spec comment ${existing.id}.`);
+            } else {
+              const { data: created } = await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                body,
+              });
+              core.info(`Created Agent Research Spec comment ${created.id}.`);
+            }
