@@ -5,7 +5,6 @@ while [ "$#" -gt 0 ]; do case "$1" in --repo) repo="$2"; shift 2;; --apply) appl
 [ -n "${repo}" ] || { echo 'Usage: configure-repo-variables.sh --repo OWNER/REPO [--apply]' >&2; exit 2; }
 values='AGENT_RESEARCH_ENABLED=false
 AGENT_IMPLEMENT_ENABLED=false
-AGENT_EVAL_ENABLED=false
 AGENT_PROJECT_SYNC_ENABLED=false
 AGENT_BASE_BRANCH=main
 AGENT_PR_REVISE_TRUSTED_BOT_ACTORS=github-copilot[bot],copilot-pull-request-reviewer[bot]'

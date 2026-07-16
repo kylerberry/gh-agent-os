@@ -23,11 +23,14 @@ Agents never merge, change repository settings, access production secrets, or de
 ## What is included
 
 - Research, implementation, and PR-revision workflows under `.github/workflows/`.
-- A focused issue form and generic agent prompts.
+- A focused issue form, generic agent prompts, and active `.github/copilot-instructions.md` that tells Copilot when to trigger revisions.
 - Bounded GitHub-context builders that treat issues, reviews, and PR text as untrusted input.
 - Optional GitHub Project V2 status sync, configured entirely through repository variables.
 - Idempotent onboarding scripts for labels, variables, Project discovery, and validation.
-- An explicitly non-functional evaluator example in `examples/optional/`; do not enable it as a production workflow.
+
+## Prerequisites
+
+All onboarding and runtime helper scripts use the [GitHub CLI (`gh`)](https://www.npmjs.com/package/@github/cli). Install it, authenticate it for GitHub.com, and ensure `gh`, `jq`, and Node.js are available in your shell before running setup.
 
 ## Quick start
 
@@ -70,7 +73,6 @@ Detailed instructions: [`docs/operations/onboarding.md`](docs/operations/onboard
 |---|---:|---|
 | `AGENT_RESEARCH_ENABLED` | `false` | Enables label-triggered research. Manual dispatch remains available. |
 | `AGENT_IMPLEMENT_ENABLED` | `false` | Enables implementation and PR revision. |
-| `AGENT_EVAL_ENABLED` | `false` | Reserved; evaluator stub is not operational. |
 | `AGENT_PROJECT_SYNC_ENABLED` | `false` | Enables Project V2 status sync. |
 | `AGENT_BASE_BRANCH` | `main` | Base branch used by the implementation workflow. |
 | `AGENT_RESEARCH_MODEL` | unset | Claude model for research. |

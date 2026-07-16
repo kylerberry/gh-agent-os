@@ -5,7 +5,6 @@ while [ "$#" -gt 0 ]; do case "$1" in --repo) repo="$2"; shift 2;; --apply) appl
 [ -n "${repo}" ] || { echo 'Usage: bootstrap-labels.sh --repo OWNER/REPO [--apply]' >&2; exit 2; }
 labels='agent:research|0E8A16|Run read-only issue research
 agent:implement|1D76DB|Run implementation after human approval
-agent:eval|5319E7|Reserved for an optional evaluator
 agent:needs-human|D93F0B|Human decision or action required
 type:feature|1D76DB|New user-visible capability
 type:bug|D73A4A|Defect correction

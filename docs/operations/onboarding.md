@@ -8,4 +8,3 @@
 6. Optionally create a Project, set up its Status options, run `discover-project-config.sh`, save returned IDs as repository variables, add `GH_PROJECT_TOKEN`, and only then enable Project sync.
 7. Enable implementation last. Test blocked output, no-change behavior, PR creation, and a single `/agent fix-this` revision in a disposable repository.
 
-Use `agent:eval` only after replacing the shipped evaluator stub with a real evaluator.
