@@ -27,6 +27,8 @@ Agents never merge, change repository settings, access production secrets, or de
 - Bounded GitHub-context builders that treat issues, reviews, and PR text as untrusted input.
 - Optional GitHub Project V2 status sync, configured entirely through repository variables.
 - Idempotent onboarding scripts for labels, variables, Project discovery, and validation.
+- A wiki-first knowledge-base starter for durable context, specifications, decisions, research, and operations; start at [`docs/README.md`](docs/README.md).
+- Repository-local agent skills for execution discipline, TDD, issue decomposition, and safe workflow triggering; see [`docs/wiki/operations/agent-skills.md`](docs/wiki/operations/agent-skills.md).
 
 ## Prerequisites
 
@@ -48,7 +50,7 @@ All onboarding and runtime helper scripts use the [GitHub CLI (`gh`)](https://ww
 
 5. Review the checklist below, set models, and enable one capability at a time. Start with research in a disposable repository.
 
-Detailed instructions: [`docs/operations/onboarding.md`](docs/operations/onboarding.md).
+Detailed instructions: [`docs/wiki/operations/onboarding.md`](docs/wiki/operations/onboarding.md).
 
 ## Required access and configuration
 
@@ -90,4 +92,4 @@ Detailed instructions: [`docs/operations/onboarding.md`](docs/operations/onboard
 - For material, agent-fixable review findings, a trusted reviewer writes exactly one **top-level** comment starting with `/agent fix-this`. The revision workflow only accepts open same-repository `agent/issue-*` PRs and detects branch races before push.
 - Use `agent:needs-human` for unanswered decisions or unavailable human-only access.
 
-Read [`docs/design/agentic-workflow.md`](docs/design/agentic-workflow.md) and [`docs/security/trust-boundaries.md`](docs/security/trust-boundaries.md) before enabling implementation.
+Read [`docs/wiki/architecture/agentic-workflow.md`](docs/wiki/architecture/agentic-workflow.md) and [`docs/wiki/architecture/trust-boundaries.md`](docs/wiki/architecture/trust-boundaries.md) before enabling implementation.
