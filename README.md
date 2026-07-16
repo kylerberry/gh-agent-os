@@ -12,7 +12,7 @@ flowchart TD
   E --> F[Maintainer applies agent:implement]
   F --> G[Agent branch and PR]
   G --> H[Human or bot review]
-  H -->|Material fixes| I[/agent fix-this top-level comment]
+  H -->|Material fixes| I["/agent fix-this top-level comment"]
   I --> J[Revision agent updates same branch]
   J --> H
   H -->|Approved| K[Human merges]
