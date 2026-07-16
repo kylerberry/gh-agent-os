@@ -30,7 +30,7 @@ Agents never merge, change repository settings, access production secrets, or de
 
 ## Prerequisites
 
-All onboarding and runtime helper scripts use the [GitHub CLI (`gh`)](https://www.npmjs.com/package/@github/cli). Install it, authenticate it for GitHub.com, and ensure `gh`, `jq`, and Node.js are available in your shell before running setup.
+All onboarding and runtime helper scripts use the [GitHub CLI (`gh`)](https://www.npmjs.com/package/@github/cli). Install it, authenticate it for GitHub.com, and ensure `gh`, [`jq`](https://www.npmjs.com/package/jq), and Node.js are available in your shell before running setup.
 
 ## Quick start
 
